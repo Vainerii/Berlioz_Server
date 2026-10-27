@@ -1,117 +1,151 @@
 package vai.berlioz.command;
 
-import java.util.Locale;
+import com.mojang.brigadier.Command;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.context.CommandContext;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
+import io.papermc.paper.command.brigadier.Commands;
+import io.papermc.paper.command.brigadier.argument.ArgumentTypes;
+import io.papermc.paper.command.brigadier.argument.resolvers.selector.PlayerSelectorArgumentResolver;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
-import org.bukkit.Location;
 import org.bukkit.command.BlockCommandSender;
-import org.bukkit.command.Command;
-import org.bukkit.command.CommandExecutor;
-import org.bukkit.command.CommandSender;
-import org.bukkit.entity.Player;
-import vai.berlioz.Messages;
-import vai.berlioz.Messages.Lang;
+import org.jspecify.annotations.NonNull;
+import vai.berlioz.BerliozServer;
+import vai.berlioz.command.arguments.UriArgumentType;
 import vai.berlioz.network.BerliozNetwork;
 
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URL;
 
-public final class BerliozCommand implements CommandExecutor {
+public class BerliozCommand {
 
-    @Override
-    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        Lang lang = Messages.langOf(sender);
-        if (!isAllowed(sender)) {
-            reply(sender, Messages.get(lang, "cmd.noPermission"), NamedTextColor.RED);
-            return true;
-        }
-        if (args.length == 0) {
-            sendUsage(sender, lang);
-            return true;
-        }
-        switch (args[0].toLowerCase(Locale.ROOT)) {
-            case "play" -> handlePlay(sender, args, lang);
-            case "stop" -> handleStop(sender, lang);
-            case "cache" -> handleCache(sender, args, lang);
-            default -> sendUsage(sender, lang);
-        }
-        return true;
+    public BerliozCommand(@NonNull BerliozServer plugin) {}
+
+    public LiteralArgumentBuilder<CommandSourceStack> createCommand() {
+        var command = Commands.literal("berlioz");
+
+        var stopArgument = Commands.literal("stop");
+        var playArgument = Commands.literal("play");
+        var preloadArgument = Commands.literal("preload")
+                .then(Commands.argument(
+                        "radius", IntegerArgumentType.integer(1)
+                )
+                        .then(
+                                Commands.argument(
+                                        "uri", new UriArgumentType()
+                                ).executes(this::preload)
+                        ));
+
+        stopArgument.executes(this::stop);
+
+        var radius = Commands.argument("radius", IntegerArgumentType.integer(1));
+        var trackUriArgument = Commands.argument("uri", new UriArgumentType());
+
+        playArgument.then(
+                radius.then(
+                        trackUriArgument.executes(this::play)
+                )
+        );
+
+        return command
+                .then(stopArgument)
+                .then(playArgument)
+                .then(preloadArgument)
+                .requires(source -> source.getSender().hasPermission(BerliozNetwork.COMMAND_PERMISSION));
     }
 
-    private void handleStop(CommandSender sender, Lang lang) {
-        Location loc = locationOf(sender);
-        if (loc == null) {
-            reply(sender, Messages.get(lang, "cmd.needPlayerOrBlock"), NamedTextColor.RED);
-            return;
-        }
-        BerliozNetwork.stopServerBroadcast(loc);
-        reply(sender, Messages.get(lang, "cmd.stopped"), NamedTextColor.AQUA);
-    }
+    private int preload(CommandContext<CommandSourceStack> ctx) {
+        var radius = ctx.getArgument("radius", Integer.class);
+        var location = ctx.getSource().getLocation();
+        var trackUri = ctx.getArgument("uri", URI.class);
 
-    private void handlePlay(CommandSender sender, String[] args, Lang lang) {
-        if (args.length < 3) {
-            reply(sender, Messages.get(lang, "cmd.usagePlay"), NamedTextColor.RED);
-            return;
-        }
-        int radius = parseRadius(sender, args[1], lang);
-        if (radius < 0) return;
-        Location loc = locationOf(sender);
-        if (loc == null) {
-            reply(sender, Messages.get(lang, "cmd.needPlayerOrBlock"), NamedTextColor.RED);
-            return;
-        }
-        String url = args[2];
-        BerliozNetwork.startServerBroadcast(loc, radius, url, sender instanceof BlockCommandSender);
-        reply(sender, Messages.get(lang, "cmd.broadcasting", radius, url), NamedTextColor.AQUA);
-    }
+        var sender = ctx.getSource().getSender();
 
-    private void handleCache(CommandSender sender, String[] args, Lang lang) {
-        if (args.length < 3) {
-            reply(sender, Messages.get(lang, "cmd.usageCache"), NamedTextColor.RED);
-            return;
-        }
-        int radius = parseRadius(sender, args[1], lang);
-        if (radius < 0) return;
-        Location loc = locationOf(sender);
-        if (loc == null) {
-            reply(sender, Messages.get(lang, "cmd.needPlayerOrBlock"), NamedTextColor.RED);
-            return;
-        }
-        BerliozNetwork.broadcastCache(loc, radius, args[2]);
-        reply(sender, Messages.get(lang, "cmd.precaching", radius, args[2]), NamedTextColor.AQUA);
-    }
-
-    private int parseRadius(CommandSender sender, String arg, Lang lang) {
         try {
-            int radius = Integer.parseInt(arg);
-            if (radius <= 0) {
-                reply(sender, Messages.get(lang, "cmd.radiusPositive"), NamedTextColor.RED);
-                return -1;
-            }
-            return radius;
-        } catch (NumberFormatException e) {
-            reply(sender, Messages.get(lang, "cmd.radiusNumber", arg), NamedTextColor.RED);
-            return -1;
+            var trackUrl = trackUri.toURL();
+
+            BerliozNetwork.broadcastCache(
+                    location,
+                    radius,
+                    trackUrl.toString()
+            );
+
+            ctx.getSource().getSender().sendMessage(
+                    Component.text(
+                            "Preloading (radius "+ radius +") :",
+                            NamedTextColor.AQUA
+                    ).append(Component.newline()).append(
+                            Component.text(trackUrl.toString(), NamedTextColor.GRAY)
+                                    .clickEvent(ClickEvent.openUrl(trackUrl))
+                    )
+            );
+        }catch (MalformedURLException e) {
+            sender.sendMessage(
+                    Component.text(e.getMessage(), NamedTextColor.RED)
+            );
         }
+
+        return Command.SINGLE_SUCCESS;
     }
 
-    private static Location locationOf(CommandSender sender) {
-        if (sender instanceof Player player) {
-            return player.getLocation();
+    private int play(CommandContext<CommandSourceStack> ctx) {
+        var radiusArgument = ctx.getArgument("radius", Integer.class);
+        var trackUri = ctx.getArgument("uri", URI.class);
+
+        var location = ctx.getSource().getLocation();
+
+        try {
+            var trackUrl = trackUri.toURL();
+            BerliozNetwork.startServerBroadcast(
+                    location,
+                    radiusArgument,
+                    trackUrl.toString(),
+                    ctx.getSource().getSender() instanceof BlockCommandSender
+            );
+
+            ctx.getSource().getSender().sendMessage(
+                    Component.text(
+                            "Broadcasting (radius "+ radiusArgument +") :",
+                            NamedTextColor.AQUA
+                    ).append(Component.newline()).append(
+                            Component.text(trackUrl.toString(), NamedTextColor.GRAY)
+                                    .clickEvent(ClickEvent.openUrl(trackUrl))
+                    )
+            );
+        }catch (MalformedURLException e) {
+            ctx.getSource().getSender().sendMessage(Component.text(
+                    e.getMessage(),
+                    NamedTextColor.RED
+            ));
         }
-        if (sender instanceof BlockCommandSender block) {
-            return block.getBlock().getLocation();
+
+        return Command.SINGLE_SUCCESS;
+    }
+
+    private int stop(CommandContext<CommandSourceStack> ctx) {
+        var sender = ctx.getSource().getSender();
+        var location = ctx.getSource().getLocation();
+
+        if(location == null) {
+            sender.sendMessage(
+                    Component.text(
+                            "This must be run at a location.",
+                            NamedTextColor.RED
+                    )
+            );
+
+            return Command.SINGLE_SUCCESS;
         }
-        return null;
-    }
 
-    private static boolean isAllowed(CommandSender sender) {
-        return !(sender instanceof Player) || sender.hasPermission(BerliozNetwork.COMMAND_PERMISSION);
-    }
+        BerliozNetwork.stopServerBroadcast(location);
+        sender.sendMessage(
+                Component.text("Stopped the nearest broadcast.", NamedTextColor.AQUA)
+        );
 
-    private void sendUsage(CommandSender sender, Lang lang) {
-        reply(sender, Messages.get(lang, "cmd.usage"), NamedTextColor.GRAY);
-    }
-
-    private static void reply(CommandSender sender, String message, NamedTextColor color) {
-        sender.sendMessage(Component.text(message, color));
+        return Command.SINGLE_SUCCESS;
     }
 }
