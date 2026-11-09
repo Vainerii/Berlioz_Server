@@ -1,5 +1,8 @@
 package vai.berlioz.network;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
@@ -24,6 +27,9 @@ import vai.berlioz.ambient.AmbientZone;
 import vai.berlioz.ambient.AmbientZoneStore;
 
 public final class BroadcastManager implements Listener {
+    /** Fade value meaning "use the client's own fade setting". */
+    static final float FADE_CLIENT_DEFAULT = -1f;
+    private static final float MAX_FADE = 30f;
     private static final int TICK_PERIOD = 10;
     private static final int MAX_RADIUS = 256;
     private static final byte[] EMPTY = new byte[0];
@@ -47,6 +53,8 @@ public final class BroadcastManager implements Listener {
         private boolean paused;
         private double baseOffset;
         private long startMillis;
+        // DJ-chosen fade (seconds) listeners apply on stop, seek and track change
+        private float fade = FADE_CLIENT_DEFAULT;
 
         private double offset(long now) {
             return paused ? baseOffset : baseOffset + (now - startMillis) / 1000.0;
@@ -91,10 +99,11 @@ public final class BroadcastManager implements Listener {
         Bukkit.getScheduler().runTaskTimer(plugin, this::tick, TICK_PERIOD, TICK_PERIOD);
     }
 
-    void startBroadcast(Player owner, int radius, String url) {
+    void startBroadcast(Player owner, int radius, String url, float fade) {
         Source s = new Source();
         s.ownerId = owner.getUniqueId();
         s.url = url;
+        s.fade = BroadcastManager.clampFade(fade);
         s.radius = Math.max(1, Math.min(radius, MAX_RADIUS));
         s.paused = false;
         s.baseOffset = 0;
@@ -120,8 +129,19 @@ public final class BroadcastManager implements Listener {
         }
     }
 
-    void stopBroadcast(Player owner) {
-        sources.remove(owner.getUniqueId());
+    void stopBroadcast(Player owner, float fade) {
+        Source s = sources.remove(owner.getUniqueId());
+        if (s == null) return;
+        long now = System.currentTimeMillis();
+        byte[] body = BroadcastManager.fadeBody(BroadcastManager.clampFade(fade));
+        heard.entrySet().removeIf(e -> {
+            Heard h = e.getValue();
+            if (h.isAmbiant || h.isServer || !s.ownerId.equals(h.source)) return false;
+            Player listener = Bukkit.getPlayer(e.getKey());
+            if (listener != null) BerliozNetwork.send(listener, MessageType.STOP_ORDER, body);
+            graceUntil.put(e.getKey(), now + graceMillis);
+            return true;
+        });
     }
 
     public void startServerBroadcast(Location origin, int radius, String url, boolean commandBlock) {
@@ -200,9 +220,10 @@ public final class BroadcastManager implements Listener {
         return UUID.nameUUIDFromBytes(("berlioz-server:" + key).getBytes(StandardCharsets.UTF_8));
     }
 
-    void seekBroadcast(Player owner, float offsetSeconds) {
+    void seekBroadcast(Player owner, float offsetSeconds, float fade) {
         Source s = sources.get(owner.getUniqueId());
         if (s == null) return;
+        s.fade = BroadcastManager.clampFade(fade);
         s.baseOffset = Math.max(0f, offsetSeconds);
         s.startMillis = System.currentTimeMillis();
         long now = System.currentTimeMillis();
@@ -255,7 +276,7 @@ public final class BroadcastManager implements Listener {
         Long prev = lastServerLoop.get(player.getUniqueId());
         if (prev != null && now - prev < MIN_SERVER_LOOP_MS) return;
         lastServerLoop.put(player.getUniqueId(), now);
-        sendPlayOrder(player, s.url, 0f, false, KIND_SERVER);
+        sendPlayOrder(player, s.url, 0f, false, KIND_SERVER, FADE_CLIENT_DEFAULT);
     }
 
     @EventHandler
@@ -337,7 +358,7 @@ public final class BroadcastManager implements Listener {
         Heard last = heard.get(id);
         if (last != null && !last.isAmbiant) {
             // Just lost a DJ or server broadcast: stop now and hold ambient back for the grace delay.
-            BerliozNetwork.send(p, MessageType.STOP_ORDER, EMPTY);
+            BerliozNetwork.send(p, MessageType.STOP_ORDER, BroadcastManager.fadeBody(FADE_CLIENT_DEFAULT));
             heard.remove(id);
             graceUntil.put(id, now + graceMillis);
             return;
@@ -350,7 +371,7 @@ public final class BroadcastManager implements Listener {
         AmbientZone zone = zones.zoneAt(p.getLocation());
         if (zone == null || zone.urls().isEmpty()) {
             if (last != null) {
-                BerliozNetwork.send(p, MessageType.STOP_ORDER, EMPTY);
+                BerliozNetwork.send(p, MessageType.STOP_ORDER, BroadcastManager.fadeBody(FADE_CLIENT_DEFAULT));
                 heard.remove(id);
             }
             return;
@@ -471,7 +492,7 @@ public final class BroadcastManager implements Listener {
         List<String> urls = zone.urls();
         int idx = ((index % urls.size()) + urls.size()) % urls.size();
         String url = urls.get(idx);
-        sendPlayOrder(listener, url, 0f, false, KIND_AMBIENT);
+        sendPlayOrder(listener, url, 0f, false, KIND_AMBIENT, FADE_CLIENT_DEFAULT);
         Heard h = new Heard();
         h.source = zone.id();
         h.url = url;
@@ -483,16 +504,31 @@ public final class BroadcastManager implements Listener {
 
     private static void sendPlayOrder(Player listener, Source source, long now) {
         byte kind = source.server ? KIND_SERVER : KIND_DJ;
-        sendPlayOrder(listener, source.url, (float) source.offset(now), source.paused, kind);
+        float fade = source.server ? FADE_CLIENT_DEFAULT : source.fade;
+        sendPlayOrder(listener, source.url, (float) source.offset(now), source.paused, kind, fade);
     }
 
-    private static void sendPlayOrder(Player listener, String url, float offset, boolean paused, byte kind) {
-        byte[] urlBytes = url.getBytes(StandardCharsets.UTF_8);
-        ByteBuffer buf = ByteBuffer.allocate(Float.BYTES + 2 + urlBytes.length);
-        buf.putFloat(offset);
-        buf.put((byte) (paused ? 1 : 0));
-        buf.put(kind);
-        buf.put(urlBytes);
-        BerliozNetwork.send(listener, MessageType.PLAY_ORDER, buf.array());
+    private static void sendPlayOrder(Player listener, String url, float offset, boolean paused, byte kind,
+            float fade) {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(baos)) {
+            out.writeFloat(offset);
+            out.writeBoolean(paused);
+            out.writeByte(kind);
+            out.writeUTF(url);
+            out.writeFloat(fade);
+        } catch (IOException e) {
+            return;
+        }
+        BerliozNetwork.send(listener, MessageType.PLAY_ORDER, baos.toByteArray());
+    }
+
+    private static byte[] fadeBody(float fade) {
+        return ByteBuffer.allocate(Float.BYTES).putFloat(fade).array();
+    }
+
+    private static float clampFade(float fade) {
+        if (Float.isNaN(fade) || fade < 0f) return FADE_CLIENT_DEFAULT;
+        return Math.min(fade, MAX_FADE);
     }
 }

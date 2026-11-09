@@ -89,14 +89,19 @@ public final class BerliozNetwork {
                 (player, body) -> relayToNearby(player, body, MessageType.CACHE_ORDER, "cache"));
 
         registerReceiver(MessageType.BROADCAST_START, (player, body) -> {
-            if (!player.hasPermission(PLAYLIST_PERMISSION) || body.length < Integer.BYTES) return;
-            ByteBuffer buf = ByteBuffer.wrap(body);
-            int radius = buf.getInt();
-            byte[] urlBytes = new byte[buf.remaining()];
-            buf.get(urlBytes);
-            String url = new String(urlBytes, StandardCharsets.UTF_8);
+            if (!player.hasPermission(PLAYLIST_PERMISSION)) return;
+            int radius;
+            String url;
+            float fade;
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(body))) {
+                radius = in.readInt();
+                url = in.readUTF();
+                fade = BerliozNetwork.readOptionalFloat(in, BroadcastManager.FADE_CLIENT_DEFAULT);
+            } catch (IOException e) {
+                return;
+            }
             if (!url.isEmpty())
-                broadcasts.startBroadcast(player, radius, url);
+                broadcasts.startBroadcast(player, radius, url, fade);
         });
         registerReceiver(MessageType.BROADCAST_PAUSE, (player, body) -> {
             if (player.hasPermission(PLAYLIST_PERMISSION)) {
@@ -108,11 +113,23 @@ public final class BerliozNetwork {
                 broadcasts.resumeBroadcast(player);
             }
         });
-        registerReceiver(MessageType.BROADCAST_STOP,
-                (player, body) -> broadcasts.stopBroadcast(player));
+        registerReceiver(MessageType.BROADCAST_STOP, (player, body) -> {
+            float fade = BroadcastManager.FADE_CLIENT_DEFAULT;
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(body))) {
+                fade = BerliozNetwork.readOptionalFloat(in, BroadcastManager.FADE_CLIENT_DEFAULT);
+            } catch (IOException ignored) {
+                // Unreadable optional field = listeners use their own
+            }
+            broadcasts.stopBroadcast(player, fade);
+        });
         registerReceiver(MessageType.BROADCAST_SEEK, (player, body) -> {
-            if (player.hasPermission(PLAYLIST_PERMISSION) && body.length >= Float.BYTES) {
-                broadcasts.seekBroadcast(player, ByteBuffer.wrap(body).getFloat());
+            if (!player.hasPermission(PLAYLIST_PERMISSION)) return;
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(body))) {
+                float offset = in.readFloat();
+                float fade = BerliozNetwork.readOptionalFloat(in, BroadcastManager.FADE_CLIENT_DEFAULT);
+                broadcasts.seekBroadcast(player, offset, fade);
+            } catch (IOException ignored) {
+                // Malformed seek = ignored
             }
         });
 
@@ -120,6 +137,10 @@ public final class BerliozNetwork {
         registerReceiver(MessageType.ZONE_SAVE, BerliozNetwork::handleZoneSave);
         registerReceiver(MessageType.ZONE_DELETE, BerliozNetwork::handleZoneDelete);
         registerReceiver(MessageType.ASK_NEXT, (player, body) -> broadcasts.askNext(player));
+    }
+
+    private static float readOptionalFloat(DataInputStream in, float fallback) throws IOException {
+        return in.available() >= Float.BYTES ? in.readFloat() : fallback;
     }
 
     private static void sendPermission(Player player) {
